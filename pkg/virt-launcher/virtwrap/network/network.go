@@ -34,6 +34,9 @@ import (
 
 const podInterface = "eth0"
 
+// Introduces constants related to networking
+const defaultFilePerms = 0600
+
 var interfaceCacheFile = "/var/run/kubevirt-private/interface-cache-%s.json"
 var qemuArgCacheFile = "/var/run/kubevirt-private/qemu-arg-%s.json"
 var NetworkInterfaceFactory = getNetworkClass
@@ -60,7 +63,7 @@ func SetupNetworkInterfaces(vmi *v1.VirtualMachineInstance, domain *api.Domain) 
 		}
 	}
 
-	for _, iface := range vmi.Spec.Domain.Devices.Interfaces {
+	for i, iface := range vmi.Spec.Domain.Devices.Interfaces {
 		network, ok := networks[iface.Name]
 		if !ok {
 			return fmt.Errorf("failed to find a network %s", iface.Name)
@@ -78,6 +81,9 @@ func SetupNetworkInterfaces(vmi *v1.VirtualMachineInstance, domain *api.Domain) 
 			podInterfaceName = fmt.Sprintf("eth%d", cniNetworks[iface.Name])
 		} else {
 			podInterfaceName = podInterface
+		}
+		if i == 1 {
+			iface.Macvtap = &v1.InterfaceMacvtap{}
 		}
 
 		err = vif.Plug(vmi, &iface, network, domain, podInterfaceName)

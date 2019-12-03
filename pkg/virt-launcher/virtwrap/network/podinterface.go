@@ -24,6 +24,7 @@ package network
 import (
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 
@@ -149,6 +150,21 @@ func getBinding(vmi *v1.VirtualMachineInstance, iface *v1.Interface, network *v1
 	}
 	if iface.Slirp != nil {
 		return &SlirpPodInterface{vmi: vmi, iface: iface, domain: domain, podInterfaceNum: podInterfaceNum}, nil
+	}
+	if iface.Macvtap != nil {
+		vif := &VIF{Name: podInterfaceName}
+		populateMacAddress(vif, iface)
+		sourceMode := iface.Macvtap.Mode
+		if sourceMode == "" {
+			sourceMode = v1.MacvtapBirdgeMode
+		}
+		return &MacvtapPodInterface{iface: iface,
+			vmi:              vmi,
+			vif:              vif,
+			domain:           domain,
+			podInterfaceNum:  podInterfaceNum,
+			podInterfaceName: podInterfaceName,
+			sourceMode:       string(sourceMode)}, nil
 	}
 	return nil, fmt.Errorf("Not implemented")
 }
@@ -344,6 +360,221 @@ func (b *BridgePodInterface) createBridge() error {
 	return nil
 }
 
+type MacvtapPodInterface struct {
+	vmi                  *v1.VirtualMachineInstance
+	vif                  *VIF
+	iface                *v1.Interface
+	podNicLink           netlink.Link
+	tapLink              netlink.Link
+	domain               *api.Domain
+	isLayer2             bool
+	podInterfaceNum      int
+	podInterfaceName     string
+	sourceMode           string
+	fds                  []*os.File
+	macvtapInterfaceName string
+}
+
+func (m *MacvtapPodInterface) discoverPodNetworkInterface() error {
+	link, err := Handler.LinkByName(m.podInterfaceName)
+	if err != nil {
+		log.Log.Reason(err).Errorf("failed to get a link for interface: %s", m.podInterfaceName)
+		return err
+	}
+	m.podNicLink = link
+
+	linkList, err := Handler.LinkList()
+	if err != nil {
+		return fmt.Errorf("could not get a list of link devices")
+	}
+	for _, l := range linkList {
+		if l.Type() == (&netlink.Macvtap{}).Type() {
+			m.tapLink = l.(*netlink.Macvtap)
+		}
+	}
+	if m.tapLink == nil {
+		return fmt.Errorf("could not get a ready macvtap link")
+	}
+	m.macvtapInterfaceName = m.tapLink.Attrs().Name
+
+	// get IP address
+	addrList, err := Handler.AddrList(m.podNicLink, netlink.FAMILY_V4)
+	if err != nil {
+		log.Log.Reason(err).Errorf("failed to get an ip address for %s", m.podInterfaceName)
+		return err
+	}
+	if len(addrList) == 0 {
+		m.isLayer2 = true
+	} else {
+		m.vif.IP = addrList[0]
+		m.isLayer2 = false
+	}
+
+	if len(m.vif.MAC) == 0 {
+		// Get interface MAC address
+		mac, err := Handler.GetMacDetails(m.macvtapInterfaceName)
+		if err != nil {
+			log.Log.Reason(err).Errorf("failed to get MAC for %s", m.macvtapInterfaceName)
+			return err
+		}
+		m.vif.MAC = mac
+	}
+
+	if m.podNicLink.Attrs().MTU < 0 || m.podNicLink.Attrs().MTU > 65535 {
+		return fmt.Errorf("MTU value out of range ")
+	}
+
+	// Get interface MTU
+	m.vif.Mtu = uint16(m.podNicLink.Attrs().MTU)
+
+	if !m.isLayer2 {
+		// Handle interface routes
+		if err := m.setInterfaceRoutes(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *MacvtapPodInterface) preparePodNetworkInterfaces() error {
+	// Set interface link to down to change its MAC address
+	if err := Handler.LinkSetDown(m.podNicLink); err != nil {
+		log.Log.Reason(err).Errorf("failed to bring link down for interface: %s", m.podInterfaceName)
+		return err
+	}
+
+	if _, err := Handler.SetRandomMac(m.podInterfaceName); err != nil {
+		return err
+	}
+
+	if err := Handler.LinkSetUp(m.podNicLink); err != nil {
+		log.Log.Reason(err).Errorf("failed to bring link up for interface: %s", m.podInterfaceName)
+		return err
+	}
+
+	if err := m.tapNetworkPair(); err != nil {
+		return err
+	}
+
+	if !m.isLayer2 {
+		// Remove IP from POD interface
+		err := Handler.AddrDel(m.podNicLink, &m.vif.IP)
+
+		if err != nil {
+			log.Log.Reason(err).Errorf("failed to delete address for interface: %s", m.podInterfaceName)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *MacvtapPodInterface) decorateConfig() error {
+	//m.domain.Spec.Devices.Interfaces[m.podInterfaceNum].Type = "direct"
+	////m.domain.Spec.Devices.Interfaces[m.podInterfaceNum].MTU = &api.MTU{Size: strconv.Itoa(m.podNicLink.Attrs().MTU)}
+	//m.domain.Spec.Devices.Interfaces[m.podInterfaceNum].MAC = &api.MAC{MAC: m.vif.MAC.String()}
+	//m.domain.Spec.Devices.Interfaces[m.podInterfaceNum].Source.Device = m.podInterfaceName
+	//m.domain.Spec.Devices.Interfaces[m.podInterfaceNum].Source.Mode = m.sourceMode
+
+	m.domain.Spec.Devices.Interfaces[m.podInterfaceNum] = api.Interface{}
+	m.domain.Spec.QEMUCmd = &api.Commandline{
+		QEMUArg: []api.Arg{
+			{Value: "-netdev"},
+			{Value: "tap,id=network-1,vhost=on,vhostfds=5,fds=6"},
+			{Value: "-device"},
+			{Value: fmt.Sprintf("driver=virtio-net-pci,netdev=network-1,mac=%s,disable-modern=false,mq=on,vectors=4,romfile=", m.vif.MAC.String())},
+		},
+	}
+
+	return nil
+}
+
+func (m *MacvtapPodInterface) loadCachedInterface(name string) (bool, error) {
+	var ifaceConfig api.Interface
+
+	isExist, err := readFromCachedFile(name, interfaceCacheFile, &ifaceConfig)
+	if err != nil {
+		return false, err
+	}
+
+	if isExist {
+		m.domain.Spec.Devices.Interfaces[m.podInterfaceNum] = ifaceConfig
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (m *MacvtapPodInterface) setCachedInterface(name string) error {
+	err := writeToCachedFile(&m.domain.Spec.Devices.Interfaces[m.podInterfaceNum], interfaceCacheFile, name)
+	return err
+}
+
+func (m *MacvtapPodInterface) setInterfaceRoutes() error {
+	routes, err := Handler.RouteList(m.podNicLink, netlink.FAMILY_V4)
+	if err != nil {
+		log.Log.Reason(err).Errorf("failed to get routes for %s", m.podInterfaceName)
+		return err
+	}
+	if len(routes) == 0 {
+		return fmt.Errorf("No gateway address found in routes for %s ", m.podInterfaceName)
+	}
+	m.vif.Gateway = routes[0].Gw
+	if len(routes) > 1 {
+		//dhcpRoutes := filterPodNetworkRoutes(routes, m.vif)
+		//m.vif.Routes = &dhcpRoutes
+		m.vif.Routes = &routes
+	}
+	return nil
+}
+
+func createMacvtapFds(linkIndex int, queues int) ([]*os.File, error) {
+	tapDev := fmt.Sprintf("/dev/tap%d", linkIndex)
+	return createFds(tapDev, queues)
+}
+
+func createFds(device string, numFds int) ([]*os.File, error) {
+	fds := make([]*os.File, numFds)
+
+	for i := 0; i < numFds; i++ {
+		f, err := os.OpenFile(device, os.O_RDWR, defaultFilePerms)
+		if err != nil {
+			cleanupFds(fds, i)
+			return nil, err
+		}
+		fds[i] = f
+	}
+	return fds, nil
+}
+
+// cleanupFds closed bundles of open fds in batch
+func cleanupFds(fds []*os.File, numFds int) {
+	maxFds := len(fds)
+
+	if numFds < maxFds {
+		maxFds = numFds
+	}
+
+	for i := 0; i < maxFds; i++ {
+		_ = fds[i].Close()
+	}
+}
+
+func (m *MacvtapPodInterface) tapNetworkPair() error {
+	// Note: The underlying interfaces need to be up prior to fd creation.
+	queues := 0
+	if *m.vmi.Spec.Domain.Devices.NetworkInterfaceMultiQueue {
+		queues = int(m.domain.Spec.VCPU.CPUs)
+	}
+	fds, err := createMacvtapFds(m.tapLink.Attrs().Index, queues)
+	if err != nil {
+		return fmt.Errorf("could not setup macvtap fds %s: %s", m.macvtapInterfaceName, err)
+	}
+	m.fds = fds
+
+	return nil
+}
+
 type MasqueradePodInterface struct {
 	vmi                 *v1.VirtualMachineInstance
 	vif                 *VIF
@@ -471,8 +702,9 @@ func (p *MasqueradePodInterface) loadCachedInterface(name string) (bool, error) 
 }
 
 func (p *MasqueradePodInterface) setCachedInterface(name string) error {
-	err := writeToCachedFile(&p.domain.Spec.Devices.Interfaces[p.podInterfaceNum], interfaceCacheFile, name)
-	return err
+	//err := writeToCachedFile(&p.domain.Spec.Devices.Interfaces[p.podInterfaceNum], interfaceCacheFile, name)
+	//return err
+	return nil
 }
 
 func (p *MasqueradePodInterface) createBridge() error {

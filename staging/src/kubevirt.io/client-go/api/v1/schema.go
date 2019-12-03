@@ -994,6 +994,7 @@ type InterfaceBindingMethod struct {
 	Slirp      *InterfaceSlirp      `json:"slirp,omitempty"`
 	Masquerade *InterfaceMasquerade `json:"masquerade,omitempty"`
 	SRIOV      *InterfaceSRIOV      `json:"sriov,omitempty"`
+	Macvtap    *InterfaceMacvtap    `json:"macvtap,omitempty"`
 }
 
 // ---
@@ -1011,6 +1012,30 @@ type InterfaceMasquerade struct{}
 // ---
 // +k8s:openapi-gen=true
 type InterfaceSRIOV struct{}
+
+type MacvtapSourceMode string
+
+const (
+	// MacvtapBirdgeMode: connecting all endpoints directly to each other.
+	MacvtapBirdgeMode MacvtapSourceMode = "bridge"
+
+	// MacvtapVEPAMode: Virtual Ethernet Port Aggregator (VEPA), the default mode.
+	// data from one endpoint to another endpoint on the same lower device gets sent down the lower device to external switch.
+	MacvtapVEPAMode MacvtapSourceMode = "vepa"
+
+	// MacvtapPrivateMode: behaves like a VEPA mode endpoint in the absence of a hairpin aware switch
+	MacvtapPrivateMode MacvtapSourceMode = "private"
+
+	// MacvtapPassthroughMode
+	MacvtapPassthroughMode MacvtapSourceMode = "passthrough"
+)
+
+// ---
+// +k8s:openapi-gen=true
+type InterfaceMacvtap struct {
+	// +optional
+	Mode MacvtapSourceMode `json:"mode,omitempty"`
+}
 
 // Port repesents a port to expose from the virtual machine.
 // Default protocol TCP.
